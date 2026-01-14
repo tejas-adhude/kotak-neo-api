@@ -1,6 +1,5 @@
 import inspect
 import json
-import asyncio
 import neo_api_client
 from neo_api_client.api_client import ApiClient
 from neo_api_client.exceptions import ApiException, ApiValueError
@@ -38,20 +37,16 @@ class NeoAPI:
                 Sets the edit token, SID, RID, and server ID in the configuration.
     """
 
-    def __init__(self, environment="uat", access_token=None, consumer_key=None, consumer_secret=None,
-                 on_message=None, on_error=None, on_close=None, on_open=None, neo_fin_key=None):
+    def __init__(self, environment="uat", access_token=None, consumer_key=None, consumer_secret=None, neo_fin_key=None):
         """
     Initializes the class and sets up the necessary configurations for the API client.
 
     Parameters:
-    environment (str): The environment has to pass by user to connect 'UAT' or 'LIVE'.
+    environment (str): The environment has to pass by user to connect 'UAT' or 'PROD'.
     access_token (str, optional): The access token used for authentication. Defaults to None.
     consumer_key (str, optional): The consumer key used for authentication. Defaults to None.
     consumer_secret (str, optional): The consumer secret used for authentication. Defaults to None.
-    on_message (function, optional): The function to be called when a message is received. Defaults to None.
-    on_error (function, optional): The function to be called when an error occurs. Defaults to None.
-    on_close (function, optional): The function to be called when the connection is closed. Defaults to None.
-    on_open (function, optional): The function to be called when the connection is established. Defaults to None.
+    neo_fin_key (str, optional): Finkey for tracking purpose
 
     Updates:
     self.on_message: sets the callback function for incoming messages for Websocket.
@@ -62,6 +57,12 @@ class NeoAPI:
     Raises:
     ApiException: if the session initiation fails.
     """
+
+        self.on_message = None
+        self.on_error = None
+        self.on_close = None
+        self.on_open = None
+
         if not access_token:
             neo_api_client.req_data_validation.validate_configuration(consumer_key, consumer_secret)
             self.configuration = neo_api_client.NeoUtility(consumer_key=consumer_key, consumer_secret=consumer_secret,
@@ -77,10 +78,6 @@ class NeoAPI:
             self.api_client = ApiClient(self.configuration)
 
         self.NeoWebSocket = None
-        self.on_message = on_message
-        self.on_error = on_error
-        self.on_close = on_close
-        self.on_open = on_open
         self.configuration.neo_fin_key = neo_fin_key
 
     def login(self, password=None, mobilenumber=None, userid=None, pan=None, mpin=None):
@@ -545,7 +542,7 @@ class NeoAPI:
             return {"Error Message": "Complete the 2fa process before accessing this application"}
 
     def quotes(self, instrument_tokens, quote_type=None, isIndex=False, session_token=None, sid=None,
-               server_id=None, on_error=None):
+               server_id=None):
         """
             Subscribe to real-time quotes for the given instrument tokens.
 
@@ -574,31 +571,30 @@ class NeoAPI:
         if not session_token and not self.configuration.edit_token:
             raise ValueError("Error! Login or pass the Session Token and SID")
 
-        if session_token and not sid:
-            raise ValueError("Kindly pass the SID token to proceed further")
-
-        if self.configuration.edit_token and self.configuration.edit_sid:
+        if not sid and not self.configuration.edit_sid:
+            raise ValueError("Error! Login or Kindly pass the SID token to proceed further")
+        
+        if not server_id and not self.configuration.serverId:
+            raise ValueError("Error! Login or Kindly pass the server ID token to proceed further")
+        
+        if(not session_token and self.configuration.edit_token):
             session_token = self.configuration.edit_token
+
+        if(not sid and self.configuration.edit_sid):
             sid = self.configuration.edit_sid
+        
+        if(not server_id and self.configuration.serverId):
             server_id = self.configuration.serverId
 
         if not self.NeoWebSocket:
+            self.check_callbacks()
             self.NeoWebSocket = neo_api_client.NeoWebSocket(sid, session_token, server_id)
+            self.set_neowebsocket_callbacks()
 
-        response = {}
-
-        def callback(message):
-            nonlocal response
-            response = {'message': message}
-
-        self.NeoWebSocket.get_quotes(instrument_tokens=instrument_tokens, quote_type=quote_type, isIndex=isIndex,
-                                     callback=callback)
-
-        if not response:
-            pass
-
+        response = self.NeoWebSocket.get_quotes(instrument_tokens=instrument_tokens, quote_type=quote_type, isIndex=isIndex)
+      
         return response
-
+        
     def __on_open(self):
         if self.on_open:
             self.on_open("The Session has been Opened!")
@@ -609,7 +605,7 @@ class NeoAPI:
             self.on_close("The Session has been Closed!")
 
     def __on_error(self, error):
-        print("[Socket]: Error !")
+        # print("[Socket]: Error !")
         if self.on_error:
             self.on_error(error)
 
@@ -618,7 +614,31 @@ class NeoAPI:
         if self.on_message:
             self.on_message(message)
 
+    def check_callbacks(self):
+        show_warning = not self.on_close or not self.on_open or not self.on_message or not self.on_error
+        if show_warning:
+            warnings = "Warning!\n"
+            if self.on_message is None:
+                warnings += "on_message callback is not Set\n"
+            if self.on_error is None:
+                warnings += "on_error callback is not Set\n"
+            if self.on_close is None:
+                warnings += "on_close callback is not Set\n"
+            if self.on_open is None:
+                warnings += "on_open callback is not Set\n"
+
+            warnings += "It is recommended to set callbacks to handle your own logic on events."
+            print(warnings)
+
+    def set_neowebsocket_callbacks(self):
+        if self.NeoWebSocket is not None:
+            self.NeoWebSocket.on_message = self.__on_message
+            self.NeoWebSocket.on_error = self.__on_error
+            self.NeoWebSocket.on_open = self.__on_open
+            self.NeoWebSocket.on_close = self.__on_close
+
     def subscribe(self, instrument_tokens, isIndex=False, isDepth=False):
+
         """
             Subscribe to live feeds for the given instrument tokens.
 
@@ -635,15 +655,16 @@ class NeoAPI:
 
             The function establishes a WebSocket connection to the trading platform and subscribes to live feeds for the specified instrument tokens. When a new feed is received, the function's internal callback functions are called with the feed data as their arguments. If an error occurs, the on_error function is called with the error message as its argument.
         """
+
+        
         if self.configuration.edit_token and self.configuration.edit_sid:
             if not self.NeoWebSocket:
+                self.check_callbacks()
                 self.NeoWebSocket = neo_api_client.NeoWebSocket(self.configuration.edit_sid,
                                                                 self.configuration.edit_token,
                                                                 self.configuration.serverId)
-
-            self.NeoWebSocket.get_live_feed(instrument_tokens=instrument_tokens, onmessage=self.__on_message,
-                                            onerror=self.__on_error, onclose=self.__on_close,
-                                            onopen=self.__on_open, isIndex=isIndex, isDepth=isDepth)
+                self.set_neowebsocket_callbacks()
+            self.NeoWebSocket.get_live_feed(instrument_tokens=instrument_tokens, isIndex=isIndex, isDepth=isDepth)
         else:
             print("Please complete the Login Flow to Subscribe the Scrips")
 
@@ -654,7 +675,8 @@ class NeoAPI:
                                                                 self.configuration.edit_token,
                                                                 self.configuration.serverId)
 
-            self.NeoWebSocket.un_subscribe_list(instrument_tokens=instrument_tokens, onmessage=self.__on_message,
+            self.set_neowebsocket_callbacks()
+            self.NeoWebSocket.un_subscribe_list(instrument_tokens=instrument_tokens,
                                                 isIndex=isIndex, isDepth=isDepth)
             print("The Data has been Un-Subscribed")
         else:
@@ -702,7 +724,7 @@ class NeoAPI:
         else:
             return {"Error Message": "Complete the 2fa process before accessing this application"}
 
-    def subscribe_to_orderfeed(self, on_message, on_close, on_error):
+    def subscribe_to_orderfeed(self):
         """
             Subscribe To OrderFeed
 
@@ -713,13 +735,13 @@ class NeoAPI:
                 Order Feed information.
         """
         if self.configuration.edit_token and self.configuration.edit_sid:
-            url = "wss://mlhsi.kotaksecurities.com/realtime?sId="
-            neo_api_client.ConnectHSM().hsm_connection(url=url, token=self.configuration.edit_token,
-                                                       sid=self.configuration.edit_sid,
-                                                       server_id=self.configuration.serverId,
-                                                       on_message=on_message,
-                                                       on_close=on_close,
-                                                       on_error=on_error)
+            self.check_callbacks()
+            if not self.NeoWebSocket:
+                self.NeoWebSocket = neo_api_client.NeoWebSocket(self.configuration.edit_sid,
+                                                                self.configuration.edit_token,
+                                                                self.configuration.serverId)
+            self.set_neowebsocket_callbacks()
+            self.NeoWebSocket.get_order_feed()
                                             
         else:
             return {"Error Message": "Complete the 2fa process before accessing this application"}
